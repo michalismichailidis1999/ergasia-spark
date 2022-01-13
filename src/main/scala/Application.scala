@@ -29,7 +29,7 @@ object Application {
     // Creating the dataframe schema which is going to have
     // 'X' and 'Y' as labels (dataframe columns)
     val schema = StructType(
-      StructField("X", FloatType, true) :: StructField("Y", IntegerType, true) :: Nil
+      StructField("X", FloatType, nullable = true) :: StructField("Y", IntegerType, nullable = true) :: Nil
     )
 
     // Creating the dataframe
@@ -99,76 +99,84 @@ object Application {
       override def run: Unit = {
         val cluster = clusters(i)
 
-        // get k nearest neighbors
-        // our algorithm is work exactly like python, is returns distances and indices array
-        val neighbors = KNearestNeighbors(cluster, numOfNeighbors)
+        val chunkSize = 10000
+        val numberOfChunks = getNumberOfChunks(cluster.size, chunkSize)
 
-        // distances and indices are an n x m array where n -> number of points in cluster
-        // and m -> number of nearest neighbors
-        // each row in distances array contains the top k closest distances from neighbor points
-        // and the corresponding row in indices array the point index in the cluster
-        val distances = neighbors._1
-        val indices = neighbors._2
+        // Break cluster into chunks to make the processing faster
+        for(j <- 0 until numberOfChunks){
+          val chunk = cluster.slice(j * chunkSize, (j + 1) * chunkSize)
 
-        // reachability distances
-        // because the distances array is sorted we just need to get the last column from the whole array
-        val rd = distances.map(distArr => distArr(distArr.length - 1))
+          // get k nearest neighbors
+          // our algorithm is work exactly like python, is returns distances and indices array
+          val neighbors = KNearestNeighbors(chunk, numOfNeighbors)
 
-        // initialize local reachability density array
-        val lrd = Array.ofDim[Float](distances.length)
+          // distances and indices are an n x m array where n -> number of points in cluster
+          // and m -> number of nearest neighbors
+          // each row in distances array contains the top k closest distances from neighbor points
+          // and the corresponding row in indices array the point index in the cluster
+          val distances = neighbors._1
+          val indices = neighbors._2
 
-        // Compute local reachability density for every point
-        // which is the inverse average from it's neighbors reachability distance
-        distances.zip(0 until distances.length).foreach(tup1 => {
-          val distArr = tup1._1
-          val i = tup1._2
+          // reachability distances
+          // because the distances array is sorted we just need to get the last column from the whole array
+          val rd = distances.map(distArr => distArr(distArr.length - 1))
 
-          var sum: Float = 0
+          // initialize local reachability density array
+          val lrd = Array.ofDim[Float](distances.length)
 
-          distArr.zip(0 until distArr.length).foreach(tup2 => {
-            val dist = tup2._1
-            val j = tup2._2
+          // Compute local reachability density for every point
+          // which is the inverse average from it's neighbors reachability distance
+          distances.zip(0 until distances.length).foreach(tup1 => {
+            val distArr = tup1._1
+            val i = tup1._2
 
-            // if the reachability distance is less than the distance between the points then add their distance
-            // else add the reachability distance of the current point
-            if (dist > rd(indices(i)(j))) {
-              sum += dist
-            } else {
-              sum += rd(indices(i)(j))
+            var sum: Float = 0
+
+            distArr.zip(0 until distArr.length).foreach(tup2 => {
+              val dist = tup2._1
+              val j = tup2._2
+
+              // if the reachability distance is less than the distance between the points then add their distance
+              // else add the reachability distance of the current point
+              if (dist > rd(indices(i)(j))) {
+                sum += dist
+              } else {
+                sum += rd(indices(i)(j))
+              }
+            })
+
+            // now compute the lrd which is the inverse of the average of the reachability distance
+            lrd(i) = 1 / (sum / numOfNeighbors)
+          })
+
+          // Initialize local outlier factor array
+          val lof = Array.ofDim[Float](indices.length)
+
+          // now compute local outlier factor of each point
+          // the formula is the average of the lrd divided by the lrd of the current point we are computing the lof
+          indices.zip(0 until indices.length).foreach(tup1 => {
+            val neighborsIndices = tup1._1
+            val index = tup1._2
+
+            var sum: Float = 0
+
+            neighborsIndices.foreach(i => {
+              sum += lrd(i)
+            })
+
+            lof(index) = (sum / numOfNeighbors) / lrd(index)
+          })
+
+          lof.zip(0 until lof.length).foreach(tup => {
+            val factor = tup._1
+            val index = tup._2
+
+            // if the local outlier factor is greater that means that the point is an outlier
+            if (factor > 1) {
+              outliers.append((cluster(index).x, cluster(index).y))
             }
           })
-
-          // now compute the lrd which is the inverse of the average of the reachability distance
-          lrd(i) = 1 / (sum / numOfNeighbors)
-        })
-
-        // Initialize local outlier factor array
-        val lof = Array.ofDim[Float](indices.length)
-
-        // now compute local outlier factor of each point
-        // the formula is the average of the lrd divided by the lrd of the current point we are computing the lof
-        indices.zip(0 until indices.length).foreach(tup1 => {
-          val neighborsIndices = tup1._1
-          val index = tup1._2
-
-          var sum: Float = 0
-
-          neighborsIndices.foreach(i => {
-            sum += lrd(i)
-          })
-
-          lof(index) = (sum / numOfNeighbors) / lrd(index)
-        })
-
-        lof.zip(0 until lof.length).foreach(tup => {
-          val factor = tup._1
-          val index = tup._2
-
-          // if the local outlier factor is greater that means that the point is an outlier
-          if (factor > 1) {
-            outliers.append((cluster(index).x, cluster(index).y))
-          }
-        })
+        }
       }
     }
 
@@ -189,19 +197,16 @@ object Application {
     val indices = Array.ofDim[Int](data.size, numOfNeighbors)
 
     // compute top k nearest neighbors using brute force
-    data.zip(0 until data.size).foreach(tup1 => {
-      val p = tup1._1
-      val index = tup1._2
-
+    var i = 0
+    data.foreach(p => {
       // store the distance between point p and point p_2 in index 0
       // and in index 1 the index of the point p_2
       val arr = Array.ofDim[(Float, Int)](data.size)
 
-      data.zip(0 until data.size).foreach(tup2 => {
-        val p_2 = tup2._1
-        val index_2 = tup2._2
-
-        arr(index_2) = (sqrt(pow(p.x - p_2.x, 2) + pow(p.y - p_2.y, 2)).asInstanceOf[Float], index_2)
+      var j = 0
+      data.foreach(p_2 => {
+        arr(j) = (sqrt(pow(p.x - p_2.x, 2) + pow(p.y - p_2.y, 2)).asInstanceOf[Float], j)
+        j += 1
       })
 
       // sort the array in ascending order, using the distances
@@ -209,12 +214,24 @@ object Application {
 
       // get next 5 elements skipping the index 0 which is going to be 0 every time
       // since the distance between itself is always zero
-      distances(index) = sortedArr.map(_._1).slice(1, numOfNeighbors)
-      indices(index) = sortedArr.map(_._2).slice(1, numOfNeighbors)
+      distances(i) = sortedArr.map(_._1).slice(1, numOfNeighbors)
+      indices(i) = sortedArr.map(_._2).slice(1, numOfNeighbors)
+
+      i += 1
     })
 
     // return distances and indices
     (distances, indices)
+  }
+
+  def getNumberOfChunks(totalSize: Int, chunkSize: Int): Int = {
+    var numberOfChunks: Int = totalSize / chunkSize
+
+    if(totalSize % chunkSize != 0){
+      numberOfChunks += 1
+    }
+
+    numberOfChunks
   }
 
   def normalize(df: DataFrame): DataFrame = {
@@ -235,7 +252,7 @@ object Application {
     val normalizedDf = df.withColumn("X", (col("X") - minX) / denX)
       .withColumn("X", col("X").cast(FloatType))
       .withColumn("Y", (col("Y") - minY) / denY)
-      .withColumn("Y", col("Y").cast(FloatType));
+      .withColumn("Y", col("Y").cast(FloatType))
 
     normalizedDf
   }
